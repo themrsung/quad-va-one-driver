@@ -29,6 +29,7 @@ final class Router {
         Router.current = self
         aad_link_set_lost_handler { Router.current?.restart() }
         Settings.chooseInitialOutput()
+        aad_engine_set_max_extra_ms(Double(Settings.maxExtraDelayMs))
         CA.listen(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDevices) { [weak self] in
             self?.check()
         }
@@ -55,6 +56,7 @@ final class Router {
             aad_engine_set_pulse(Settings.pulse(uid: uid, name: name) ? 1 : 0)
         }
         aad_engine_set_comfort(Settings.mode == .comfort ? 1 : 0, Settings.preset.params)
+        aad_engine_set_max_extra_ms(Double(Settings.maxExtraDelayMs))
         onChange?()
     }
 

@@ -12,5 +12,7 @@ clang -Wall -Wextra -Werror -O2 -DAAD_TESTING -bundle -framework CoreAudio -fram
 cp "$ROOT/driver/Info.plist" "$OUT/AnalogAudioDevice.driver/Contents/Info.plist"
 clang -Wall -O2 -framework CoreAudio -framework CoreFoundation -o "$OUT/driver_smoke" "$ROOT/tests/driver_smoke.c"
 clang -Wall -O2 -o "$OUT/dsp_test" "$ROOT/tests/dsp_test.c" "$ROOT/app/Engine/dsp.c"
+clang -Wall -Wextra -Werror -O2 -o "$OUT/adapt_test" "$ROOT/tests/adapt_test.c" "$ROOT/app/Engine/adapt.c"
 echo "== driver"; "$OUT/driver_smoke" "$OUT/AnalogAudioDevice.driver"
 echo; echo "== dsp"; "$OUT/dsp_test"
+echo; echo "== adapt"; "$OUT/adapt_test"

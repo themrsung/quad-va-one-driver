@@ -13,9 +13,12 @@ typedef struct {
     double sampleRate;
     double fillFrames;   // average shared-ring fill over the last control period
     double targetFrames;
+    double extraFrames;   // headroom added on top of the base target (adaptive)
+    double minFillFrames; // lowest fill after a read in the last control period (< 0: none)
     double rateAdjust;   // the virtual device's clock adjustment now in effect
     uint64_t underruns;
     uint64_t drops;      // frames the driver had to drop (ring full)
+    uint64_t overloads;  // IO overloads reported by either device
     int pulsing;
 } AADStatus;
 
@@ -29,6 +32,9 @@ OSStatus aad_engine_start(AudioObjectID virtualDevice, AudioObjectID outputDevic
 void aad_engine_stop(void);
 void aad_engine_set_comfort(int enabled, AADPreset preset);
 void aad_engine_set_pulse(int enabled);
-// Call about once a second: steers the virtual device's clock to the output device's.
+// The most extra ring delay (ms) the engine may add under load; 0 turns the adaptation off.
+void aad_engine_set_max_extra_ms(double ms);
+// Call about once a second: adapts the fill target and steers the virtual device's clock to the
+// output device's.
 void aad_engine_control_tick(double seconds);
 AADStatus aad_engine_status(void);

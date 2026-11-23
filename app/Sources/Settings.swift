@@ -19,6 +19,13 @@ enum Settings {
         set { d.set(newValue.id, forKey: "preset") }
     }
 
+    /// The most extra ring delay the engine may add when the system is busy, in ms (0: off).
+    static let maxExtraDelayChoices = [0, 10, 25, 50, 100, 200]
+    static var maxExtraDelayMs: Int {
+        get { d.object(forKey: "maxExtraDelayMs") as? Int ?? 50 }
+        set { d.set(newValue, forKey: "maxExtraDelayMs") }
+    }
+
     /// The downstream device, by UID, and its name for when it's unplugged.
     static var outputUID: String? {
         get { d.string(forKey: "outputUID") }

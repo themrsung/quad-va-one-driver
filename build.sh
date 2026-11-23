@@ -1,6 +1,6 @@
 #!/bin/bash
 # Builds and signs build/AnalogAudioDevice.driver, build/me.sjun.AnalogAudio.broker and
-# build/Analog Audio.app. SIGN_IDENTITY overrides the signing identity.
+# build/Analog Audio.app, and build/analog-audio (the CLI). SIGN_IDENTITY overrides the signing identity.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -32,16 +32,19 @@ clang "${CFLAGS[@]}" -DAAD_TEAM_ID="\"$TEAM_ID\"" -o "$BROKER" "$ROOT/broker/bro
 codesign --force --sign "$IDENTITY" --options runtime --timestamp=none --identifier me.sjun.AnalogAudio.broker "$BROKER"
 
 echo "==> App"
-for src in engine dsp; do
+for src in engine dsp adapt; do
   clang "${CFLAGS[@]}" -DAAD_TEAM_ID="\"$TEAM_ID\"" -c "$ROOT/app/Engine/$src.c" -o "$BUILD/obj/$src.o"
 done
 swiftc -O -wmo -swift-version 5 -target "$TARGET" \
   -import-objc-header "$ROOT/app/Engine/Bridge.h" \
   -o "$APP/Contents/MacOS/AnalogAudio" \
-  "$ROOT"/app/Sources/*.swift "$BUILD/obj/engine.o" "$BUILD/obj/dsp.o"
+  "$ROOT"/app/Sources/*.swift "$BUILD/obj/engine.o" "$BUILD/obj/dsp.o" "$BUILD/obj/adapt.o"
 cp "$ROOT/app/Info.plist" "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 codesign --force --sign "$IDENTITY" --options runtime --timestamp=none "$APP"
+
+echo "==> CLI"
+clang "${CFLAGS[@]}" -framework CoreFoundation -o "$BUILD/analog-audio" "$ROOT/cli/analog-audio.c"
 
 for x in "$DRIVER" "$BROKER" "$APP"; do codesign --verify --strict "$x"; done
 echo "==> Signed with: $IDENTITY (team $TEAM_ID)"

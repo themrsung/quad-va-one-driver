@@ -12,7 +12,7 @@ Status: installed on mini-m6 and in testing.
 
 ```sh
 ./build.sh       # build/: the driver, the broker and the app, signed
-tests/run.sh     # driver (loaded with a fake host), shared memory and DSP tests
+tests/run.sh     # driver (loaded with a fake host), shared memory, DSP and buffer-headroom tests
 ./install.sh     # app to /Applications; broker and driver only if they changed (sudo; a new driver restarts coreaudiod)
 ./uninstall.sh
 ```
@@ -20,6 +20,13 @@ tests/run.sh     # driver (loaded with a fake host), shared memory and DSP tests
 Signing uses the Apple Development identity (override with `SIGN_IDENTITY`), so it's for this
 Mac only. No permissions to grant: the app never records audio input, so macOS doesn't show the
 microphone as in use. Then quit QUAD Keep-Alive, which this replaces.
+
+## Command line
+
+`analog-audio play|resume|pause|stop` controls whatever app has Now Playing, through MediaRemote
+(what the media keys use), so it works over ssh too. Separate play and pause commands, not a
+toggle. `./build.sh` builds it to `build/analog-audio`; copy it onto your PATH
+(`cp build/analog-audio ~/.local/bin/`).
 
 ## Modes
 
@@ -103,12 +110,34 @@ would light up the microphone indicator, so the two share memory instead:
    samples. On launch it makes the virtual device the system output; on quit it hands the system
    output back to the chosen device.
 
+## Buffer headroom under load
+
+The ring normally holds about the virtual device's buffer plus 256 frames (~16 ms at 48 kHz). When
+the system gets tight, the app adds headroom, up to the maximum chosen in the menu (`Extra Buffer
+Under Load`: off, 10, 25, 50 (default), 100 or 200 ms):
+
+- on a dropout (the ring ran dry while something was playing) it adds 20 ms at once; the engine
+  re-primes after a dropout anyway, so the re-prime fills the new target;
+- while either device reports an IO overload, or the ring dips under 1 ms after a read, it adds
+  2 ms per second;
+- after two minutes without trouble it gives the headroom back at 0.1 ms per second.
+
+Apart from the dropout jump, growing and shrinking go through the clock steering, so Passthrough
+stays bit-exact. The policy is `app/Engine/adapt.c`. The engine logs every dropout, overload and
+target change (kept, so `log show` finds them later), plus a fill/clock summary every 10 s at debug
+level (live only):
+
+```sh
+log show --last 1h --predicate 'subsystem == "me.sjun.AnalogAudio" AND category == "engine"'
+log stream --level debug --predicate 'subsystem == "me.sjun.AnalogAudio" AND category == "engine"'
+```
+
 ## Known caveats
 
 - The output device is kept running, so coreaudiod holds its usual "audio playing" sleep
   assertion all the time (already the case here with `com.user.caffeinate`).
 - Apps see no output latency beyond the virtual device's, so A/V sync is off by the ring's fill
-  (~20 ms at 48 kHz) plus the output device's own latency.
+  (~20 ms at 48 kHz, more while headroom is added) plus the output device's own latency.
 
 ## Later
 

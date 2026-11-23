@@ -1,5 +1,7 @@
 #include "engine.h"
+#include "adapt.h"
 #include <dispatch/dispatch.h>
+#include <os/log.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -24,7 +26,9 @@ static struct {
     AudioDeviceIOProcID outProc;
     int running;
     double sr;
-    uint32_t target; // average fill to hold, in frames
+    _Atomic uint32_t target; // average fill to hold, in frames (read by the output thread to prime)
+    double baseTarget;
+    double maxRingTarget; // the most the ring can sensibly hold
     UInt32 lBuf, lCh, rBuf, rCh;
 
     // The ring shared with the driver (producer); we're the consumer, from the output IO thread.
@@ -52,11 +56,19 @@ static struct {
 
     // Output thread → main thread.
     _Atomic uint64_t fillSum, fillCount, underruns;
+    _Atomic uint64_t minFill; // lowest fill after a read since the last tick; UINT64_MAX: none
     _Atomic int pulsing;
 
+    // HAL listener threads → main thread.
+    _Atomic uint64_t overloads;
+
     // Main thread.
-    double integral, rateAdjust, lastFill;
-} E = {.pulsePos = -1, .rateAdjust = 1, .pulseEnabled = 1};
+    double integral, rateAdjust, lastFill, lastMinFill;
+    double maxExtraMs;
+    AADAdapt adapt;
+    os_log_t log;
+    int ticks;
+} E = {.pulsePos = -1, .rateAdjust = 1, .pulseEnabled = 1, .minFill = UINT64_MAX, .maxExtraMs = 50};
 
 // MARK: - Helpers
 
@@ -159,7 +171,7 @@ static int ReadRing(uint32_t n) {
     uint64_t r = atomic_load_explicit(&sh->readPos, memory_order_relaxed);
     uint64_t w = atomic_load_explicit(&sh->writePos, memory_order_acquire);
     uint64_t avail = w - r;
-    if (!E.primed && avail >= E.target + n) E.primed = 1;
+    if (!E.primed && avail >= atomic_load_explicit(&E.target, memory_order_relaxed) + n) E.primed = 1;
     if (E.primed && avail < n) {
         E.primed = 0;
         atomic_fetch_add_explicit(&E.underruns, 1, memory_order_relaxed);
@@ -180,6 +192,8 @@ static int ReadRing(uint32_t n) {
     if (n > first) memcpy(E.dry + first * 2, &sh->data[0], (n - first) * 2 * sizeof(float));
     atomic_store_explicit(&sh->readPos, r + n, memory_order_release);
     atomic_fetch_add_explicit(&E.fillSum, avail - n, memory_order_relaxed);
+    if (avail - n < atomic_load_explicit(&E.minFill, memory_order_relaxed))
+        atomic_store_explicit(&E.minFill, avail - n, memory_order_relaxed); // only this thread lowers it
     atomic_fetch_add_explicit(&E.fillCount, 1, memory_order_relaxed);
     return 1;
 }
@@ -269,6 +283,26 @@ static OSStatus OutputProc(AudioObjectID dev, const AudioTimeStamp *now, const A
 
 // MARK: - Control
 
+// Either device's IO running late (an IOProc overran its deadline).
+static OSStatus OverloadListener(AudioObjectID obj, UInt32 n, const AudioObjectPropertyAddress *a, void *ctx) {
+    (void)obj; (void)n; (void)a; (void)ctx;
+    atomic_fetch_add_explicit(&E.overloads, 1, memory_order_relaxed);
+    return noErr;
+}
+
+static const AudioObjectPropertyAddress kOverload = {kAudioDeviceProcessorOverload, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+
+static void ListenOverloads(int on) {
+    AudioObjectID devs[2] = {E.inDev, E.outDev};
+    for (int i = 0; i < 2; i++) {
+        if (!devs[i]) continue;
+        if (on) AudioObjectAddPropertyListener(devs[i], &kOverload, OverloadListener, NULL);
+        else AudioObjectRemovePropertyListener(devs[i], &kOverload, OverloadListener, NULL);
+    }
+}
+
+static double Ms(double frames) { return E.sr > 0 ? frames / E.sr * 1000.0 : 0; }
+
 // MARK: - Broker
 
 static AADShared *gLinked;
@@ -338,12 +372,22 @@ OSStatus aad_engine_start(AudioObjectID virtualDevice, AudioObjectID outputDevic
     E.sr = sr;
     E.shared = shared;
     UInt32 inBuf = GetU32(virtualDevice, kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, 512);
-    E.target = (inBuf > 512 ? inBuf : 512) + 256;
+    E.baseTarget = (inBuf > 512 ? inBuf : 512) + 256;
+    E.maxRingTarget = AAD_SHARED_FRAMES * 0.75;
+    if (!E.log) E.log = os_log_create("me.sjun.AnalogAudio", "engine");
+    // Keep any headroom earned before a restart (same device, same rate); otherwise start at base.
+    double keepExtraMs = E.adapt.sr == sr ? Ms(E.adapt.extra) : 0;
+    aad_adapt_init(&E.adapt, sr, E.baseTarget, E.maxExtraMs, atomic_load(&E.underruns), atomic_load(&E.overloads));
+    E.adapt.extra = keepExtraMs / 1000.0 * sr;
+    aad_adapt_set_cap(&E.adapt, E.maxExtraMs);
+    double t = E.baseTarget + E.adapt.extra;
+    atomic_store(&E.target, (uint32_t)(t < E.maxRingTarget ? t : E.maxRingTarget));
 
     // Skip whatever the driver wrote while nobody was reading.
     atomic_store(&shared->readPos, atomic_load(&shared->writePos));
     atomic_store(&E.fillSum, 0);
     atomic_store(&E.fillCount, 0);
+    atomic_store(&E.minFill, UINT64_MAX);
     E.primed = 0;
     E.mix = 0;
     E.rtSeq = (uint32_t)-1;
@@ -363,6 +407,7 @@ OSStatus aad_engine_start(AudioObjectID virtualDevice, AudioObjectID outputDevic
     if ((err = AudioDeviceCreateIOProcID(outputDevice, OutputProc, NULL, &E.outProc))) goto fail;
     DisableStreams(outputDevice, E.outProc, kAudioObjectPropertyScopeInput);
     if ((err = AudioDeviceStart(outputDevice, E.outProc))) goto fail;
+    ListenOverloads(1);
     E.running = 1;
     return noErr;
 
@@ -377,7 +422,10 @@ void aad_engine_stop(void) {
         AudioDeviceDestroyIOProcID(E.outDev, E.outProc);
         E.outProc = NULL;
     }
-    if (E.running) SetRateAdjust(1.0);
+    if (E.running) {
+        ListenOverloads(0);
+        SetRateAdjust(1.0);
+    }
     E.running = 0;
     atomic_store(&E.pulsing, 0);
 }
@@ -391,16 +439,43 @@ void aad_engine_set_comfort(int enabled, AADPreset preset) {
 
 void aad_engine_set_pulse(int enabled) { atomic_store(&E.pulseEnabled, enabled); }
 
+void aad_engine_set_max_extra_ms(double ms) {
+    E.maxExtraMs = ms > 0 ? ms : 0;
+    if (E.adapt.sr > 0) aad_adapt_set_cap(&E.adapt, E.maxExtraMs);
+}
+
 void aad_engine_control_tick(double seconds) {
     if (!E.running) return;
     uint64_t sum = atomic_exchange(&E.fillSum, 0);
     uint64_t count = atomic_exchange(&E.fillCount, 0);
+    uint64_t minFill = atomic_exchange(&E.minFill, UINT64_MAX);
+    uint64_t underruns = atomic_load(&E.underruns), overloads = atomic_load(&E.overloads);
+
+    // Headroom: grow the target when the system is tight, shrink it back when it's quiet. When
+    // nothing plays, coreaudiod stops the virtual device and the ring drains: not a dropout.
+    if (!GetU32(E.inDev, kAudioDevicePropertyDeviceIsRunningSomewhere, kAudioObjectPropertyScopeGlobal, 1)) {
+        E.adapt.underruns = underruns;
+        minFill = UINT64_MAX;
+    }
+    uint32_t oldTarget = atomic_load(&E.target);
+    uint64_t oldUnder = E.adapt.underruns, oldOver = E.adapt.overloads;
+    double t = aad_adapt_tick(&E.adapt, seconds, underruns, overloads, minFill == UINT64_MAX ? -1 : (double)minFill);
+    if (t > E.maxRingTarget) t = E.maxRingTarget;
+    atomic_store(&E.target, (uint32_t)t);
+    E.lastMinFill = minFill == UINT64_MAX ? -1 : (double)minFill;
+    if (underruns != oldUnder || overloads != oldOver || (uint32_t)t != oldTarget)
+        os_log(E.log, "dropouts +%llu, overloads +%llu, min fill %.1f ms, target %.1f -> %.1f ms",
+               underruns - oldUnder, overloads - oldOver, Ms(E.lastMinFill), Ms(oldTarget), Ms(t));
+    if (++E.ticks % 10 == 0)
+        os_log_debug(E.log, "fill %.1f ms (min %.1f), target %.1f ms, clock %+.0f ppm, dropouts %llu, overloads %llu",
+                     Ms(E.lastFill), Ms(E.lastMinFill), Ms(t), (E.rateAdjust - 1) * 1e6, underruns, overloads);
+
     if (count == 0) return;
     double fill = (double)sum / (double)count;
     E.lastFill = fill;
 
     // Too full: the virtual device produces faster than the output consumes, so slow it down.
-    double e = fill - E.target;
+    double e = fill - atomic_load(&E.target);
     E.integral += e * seconds;
     double iMax = RATE_ADJUST_LIMIT * E.sr * I_SECONDS;
     if (E.integral > iMax) E.integral = iMax;
@@ -416,7 +491,10 @@ AADStatus aad_engine_status(void) {
     s.running = E.running;
     s.sampleRate = E.sr;
     s.fillFrames = E.lastFill;
-    s.targetFrames = E.target;
+    s.targetFrames = atomic_load(&E.target);
+    s.extraFrames = E.adapt.extra;
+    s.minFillFrames = E.lastMinFill;
+    s.overloads = atomic_load(&E.overloads);
     s.rateAdjust = E.rateAdjust;
     s.underruns = atomic_load(&E.underruns);
     s.drops = E.shared ? atomic_load(&E.shared->drops) : 0;

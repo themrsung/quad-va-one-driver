@@ -91,6 +91,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         output.submenu = outputs
         menu.addItem(output)
 
+        let maxExtra = Settings.maxExtraDelayMs
+        let headroom = NSMenuItem(title: maxExtra > 0 ? "Extra Buffer Under Load: up to \(maxExtra) ms" : "Extra Buffer Under Load: Off",
+                                  action: nil, keyEquivalent: "")
+        let headroomMenu = NSMenu()
+        for ms in Settings.maxExtraDelayChoices {
+            let c = item(ms > 0 ? "Up to \(ms) ms" : "Off", #selector(chooseMaxExtra(_:)))
+            c.representedObject = ms
+            c.state = ms == maxExtra ? .on : .off
+            headroomMenu.addItem(c)
+        }
+        headroom.submenu = headroomMenu
+        menu.addItem(headroom)
+
         if let uid = chosen {
             let name = Settings.outputName ?? ""
             let pulse = item("Keep-Alive Pulse for This Output", #selector(togglePulse))
@@ -120,6 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let ms = s.sampleRate > 0 ? s.fillFrames / s.sampleRate * 1000 : 0
             let ppm = (s.rateAdjust - 1) * 1e6
             var second = String(format: "buffer %.1f ms · clock %+.0f ppm", ms, ppm)
+            if s.extraFrames > 0, s.sampleRate > 0 { second += String(format: " · +%.0f ms headroom", s.extraFrames / s.sampleRate * 1000) }
             if s.underruns > 0 { second += " · \(s.underruns) dropouts" }
             if s.pulsing != 0 { second += " · pulse" }
             return [first, second]
@@ -166,6 +180,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func togglePulse() {
         guard let uid = Settings.outputUID else { return }
         Settings.setPulse(!Settings.pulse(uid: uid, name: Settings.outputName ?? ""), uid: uid)
+        router.apply()
+    }
+
+    @objc private func chooseMaxExtra(_ sender: NSMenuItem) {
+        guard let ms = sender.representedObject as? Int else { return }
+        Settings.maxExtraDelayMs = ms
         router.apply()
     }
 
